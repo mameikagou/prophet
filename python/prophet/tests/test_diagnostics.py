@@ -5,6 +5,7 @@
 
 import datetime
 import itertools
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -22,6 +23,19 @@ class CustomParallelBackend:
     def map(self, func, *iterables):
         results = [func(*args) for args in zip(*iterables)]
         return results
+
+
+def make_cross_validation_model():
+    return SimpleNamespace(
+        history=pd.DataFrame(
+            {
+                "ds": pd.date_range("2020-01-01", periods=10, freq="D"),
+                "y": np.arange(10, dtype=float),
+            }
+        ),
+        seasonalities={},
+        uncertainty_samples=0,
+    )
 
 
 PARALLEL_METHODS = [None, "processes", "threads", CustomParallelBackend()]
@@ -83,6 +97,93 @@ class TestCrossValidation:
         assert len(np.unique(df_cv["cutoff"])) == 1
         with pytest.raises(ValueError):
             diagnostics.cross_validation(m, horizon="10 days", period="10 days", initial="140 days")
+
+    @pytest.mark.parametrize("raises", [False, True])
+    @pytest.mark.parametrize(
+        ("parallel_method", "executor_name"),
+        [("threads", "ThreadPoolExecutor"), ("processes", "ProcessPoolExecutor")],
+    )
+    def test_cross_validation_internal_executor_lifecycle(
+        self, monkeypatch, parallel_method, executor_name, raises
+    ):
+        m = make_cross_validation_model()
+        cutoff = m.history["ds"].iloc[3]
+        created = []
+
+        class TrackingExecutor:
+            def __init__(self, *args, **kwargs):
+                self.shutdown_calls = 0
+                created.append(self)
+
+            def map(self, func, *iterables):
+                if raises:
+                    raise RuntimeError("map failed")
+                return [func(*args) for args in zip(*iterables)]
+
+            def shutdown(self, wait=True):
+                self.shutdown_calls += 1
+
+        monkeypatch.setattr(
+            diagnostics.concurrent.futures, executor_name, TrackingExecutor
+        )
+        prediction = pd.DataFrame(
+            {"ds": [cutoff], "yhat": [0.0], "y": [0.0], "cutoff": [cutoff]}
+        )
+        monkeypatch.setattr(
+            diagnostics, "single_cutoff_forecast", lambda *args: prediction.copy()
+        )
+
+        if raises:
+            with pytest.raises(RuntimeError, match="map failed"):
+                diagnostics.cross_validation(
+                    m,
+                    horizon="1 day",
+                    cutoffs=[cutoff],
+                    parallel=parallel_method,
+                    disable_tqdm=True,
+                )
+        else:
+            for _ in range(3):
+                result = diagnostics.cross_validation(
+                    m,
+                    horizon="1 day",
+                    cutoffs=[cutoff],
+                    parallel=parallel_method,
+                    disable_tqdm=True,
+                )
+                assert result.loc[0, "yhat"] == 0.0
+
+        expected_calls = 1 if raises else 3
+        assert len(created) == expected_calls
+        assert [executor.shutdown_calls for executor in created] == [1] * expected_calls
+
+    def test_cross_validation_does_not_shutdown_caller_executor(self):
+        m = make_cross_validation_model()
+        cutoff = m.history["ds"].iloc[3]
+        prediction = pd.DataFrame(
+            {"ds": [cutoff], "yhat": [0.0], "y": [0.0], "cutoff": [cutoff]}
+        )
+
+        class CallerExecutor:
+            shutdown_calls = 0
+
+            def map(self, func, *iterables):
+                return [prediction]
+
+            def shutdown(self, wait=True):
+                self.shutdown_calls += 1
+
+        executor = CallerExecutor()
+        result = diagnostics.cross_validation(
+            m,
+            horizon="1 day",
+            cutoffs=[cutoff],
+            parallel=executor,
+            disable_tqdm=True,
+        )
+
+        assert result.loc[0, "yhat"] == 0.0
+        assert executor.shutdown_calls == 0
 
     def test_bad_parallel_methods(self, ts_short, backend):
         m = Prophet(stan_backend=backend)
