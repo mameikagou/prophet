@@ -4,6 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import datetime
+import concurrent.futures
 import itertools
 from types import SimpleNamespace
 
@@ -110,18 +111,23 @@ class TestCrossValidation:
         cutoff = m.history["ds"].iloc[3]
         created = []
 
-        class TrackingExecutor:
+        executor_type = concurrent.futures.ThreadPoolExecutor
+
+        class TrackingExecutor(executor_type):
             def __init__(self, *args, **kwargs):
+                kwargs.pop("mp_context", None)
+                super().__init__(*args, **kwargs)
                 self.shutdown_calls = 0
                 created.append(self)
 
             def map(self, func, *iterables):
                 if raises:
                     raise RuntimeError("map failed")
-                return [func(*args) for args in zip(*iterables)]
+                return super().map(func, *iterables)
 
-            def shutdown(self, wait=True):
+            def shutdown(self, wait=True, *, cancel_futures=False):
                 self.shutdown_calls += 1
+                super().shutdown(wait=wait, cancel_futures=cancel_futures)
 
         monkeypatch.setattr(
             diagnostics.concurrent.futures, executor_name, TrackingExecutor
@@ -157,33 +163,27 @@ class TestCrossValidation:
         assert len(created) == expected_calls
         assert [executor.shutdown_calls for executor in created] == [1] * expected_calls
 
-    def test_cross_validation_does_not_shutdown_caller_executor(self):
+    def test_cross_validation_does_not_shutdown_caller_executor(self, monkeypatch):
         m = make_cross_validation_model()
         cutoff = m.history["ds"].iloc[3]
         prediction = pd.DataFrame(
             {"ds": [cutoff], "yhat": [0.0], "y": [0.0], "cutoff": [cutoff]}
         )
 
-        class CallerExecutor:
-            shutdown_calls = 0
-
-            def map(self, func, *iterables):
-                return [prediction]
-
-            def shutdown(self, wait=True):
-                self.shutdown_calls += 1
-
-        executor = CallerExecutor()
-        result = diagnostics.cross_validation(
-            m,
-            horizon="1 day",
-            cutoffs=[cutoff],
-            parallel=executor,
-            disable_tqdm=True,
+        monkeypatch.setattr(
+            diagnostics, "single_cutoff_forecast", lambda *args: prediction.copy()
         )
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            result = diagnostics.cross_validation(
+                m,
+                horizon="1 day",
+                cutoffs=[cutoff],
+                parallel=executor,
+                disable_tqdm=True,
+            )
 
-        assert result.loc[0, "yhat"] == 0.0
-        assert executor.shutdown_calls == 0
+            assert result.loc[0, "yhat"] == 0.0
+            assert executor.submit(lambda: "still usable").result() == "still usable"
 
     def test_bad_parallel_methods(self, ts_short, backend):
         m = Prophet(stan_backend=backend)

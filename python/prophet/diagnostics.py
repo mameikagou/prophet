@@ -212,18 +212,15 @@ def cross_validation(
 
     if parallel:
         valid = {"threads", "processes", "dask"}
-        _owns_pool = False
 
         if parallel == "threads":
             pool = concurrent.futures.ThreadPoolExecutor()
-            _owns_pool = True
         elif parallel == "processes":
             if sys.platform.startswith("win") or sys.platform == "darwin":
                 ctx = multiprocessing.get_context("spawn")
             else:
                 ctx = multiprocessing.get_context("forkserver")
             pool = concurrent.futures.ProcessPoolExecutor(mp_context=ctx)
-            _owns_pool = True
         elif parallel == "dask":
             try:
                 from dask.distributed import get_client
@@ -252,7 +249,10 @@ def cross_validation(
                 # convert Futures to DataFrames
                 predicts = cast("dd.Client", pool).gather(predicts)
         finally:
-            if _owns_pool:
+            if (
+                parallel in ("threads", "processes")
+                and isinstance(pool, concurrent.futures.Executor)
+            ):
                 pool.shutdown(wait=True)
 
     else:
